@@ -68,8 +68,7 @@ namespace Cmd_Save
 		if (!ServerUtilityFields::SaveCommand.On())
 		{
 			LOG_WARN("[RCON] The loader has no row for the UObject class on this game build - save command off.");
-			return "Error: save command unavailable on this game build.
-";
+			return "Error: save command unavailable on this game build.\n";
 		}
 
 		// Find the UCrSaveSubsystem *instance* (not the UClass or CDO).

@@ -408,7 +408,7 @@ namespace RulesModel
 			r.adminsOnly = adminsOnly;
 			auto it = FindRule(m, r.plugin, r.id);
 			if (it != m.rules.end()) { it->deny = deny; it->adminsOnly = adminsOnly; return true; }
-		if (m.rules.size() >= kMaxRules) { error = "too many rules (most " + std::to_string(kMaxRules) + ")"; return false; }
+			if (m.rules.size() >= kMaxRules) { error = "too many rules (most " + std::to_string(kMaxRules) + ")"; return false; }
 			m.rules.push_back(r);
 			return true;
 		}

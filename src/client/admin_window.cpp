@@ -145,7 +145,6 @@ namespace
 	}
 
 	// Default / Allow / Admins only / Deny for one rule key ("Admins only" when the server knows it).
-	
 	void DrawRuleCombo(Frame& f, const std::string& key)
 	{
 		IModLoaderImGui* ui = f.ui;

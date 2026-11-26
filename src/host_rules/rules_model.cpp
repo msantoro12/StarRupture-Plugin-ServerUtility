@@ -37,6 +37,11 @@ namespace RulesModel
 			{ "Best Builder", "unlock-all-buildings" },
 			{ "CameraControls", "vitals" },
 			{ "WaveOptimiser", "heat-tools" },
+			{ "BetterDrone", "mining-laser" },
+			{ "BetterDrone", "map-reveal" },
+			{ "BetterDrone", "drone-limits" },
+			{ "BetterDrone", "always-allow" },
+			{ "BetterDrone", "drone-interact" },
 		};
 
 		// The loader takes at most 2048 records, the header counts as one, and every default row is one.

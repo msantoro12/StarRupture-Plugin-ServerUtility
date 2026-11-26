@@ -3,6 +3,7 @@
 //   cl /nologo /EHsc /std:c++17 /Isrc tests\admin_client_tests.cpp src\client\admin_client.cpp src\client\admin_view.cpp src\admin_wire\admin_wire.cpp src\admin_wire\admin_crypto.cpp /Fe:admin_client_tests.exe
 //   admin_client_tests.exe
 #include "client/admin_client.h"
+#include "client/admin_view.h"
 #include "admin_wire/admin_crypto.h"
 
 #include <algorithm>
@@ -883,6 +884,9 @@ int main()
 		// Staging "admins" is accepted, goes out as is, and shows in the effective rules.
 		Op a; a.name = "rule.set"; a.args = { "BetterCheats.movement", "admins" };
 		CHECK(r.client->Stage(a));
+		v = r.View();
+		const AdminWire::Snapshot eff = AdminView::ApplyStaged(v.snapshot, v.staged);
+		CHECK(AdminView::RuleValue(eff, "BetterCheats.movement") == "admins" && eff.adminsOnlySupported);
 		r.Clear();
 		CHECK(r.client->Apply());
 		const Message* o = r.Last(Tag::Ops);

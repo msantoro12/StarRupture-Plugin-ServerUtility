@@ -16,6 +16,7 @@
 #include "admin_wire/admin_crypto.h"
 #include "rcon/commands/word_split.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -891,6 +892,144 @@ static void ProofGateTests()
 	}
 }
 
+// The join hold: a listed admin with a secret on file gets the admin's set from PostLogin, until the
+// admin check passes (same text, so nothing is sent again), fails or runs out kProofHoldMs.
+static void ProofHoldTests()
+{
+	using namespace RulesModel;
+	std::vector<std::string> dw;
+	const std::string path = (std::filesystem::temp_directory_path() / "su-iga-hold-test.txt").string();
+	std::filesystem::remove(path);
+
+	// What ApplyRules sends one connection: its own set when the flags ask for one, else the server rules.
+	struct State { bool listed, admin, secret, proven, tool, recorded; unsigned long long age; };
+	const auto sent = [](const Model& m, const State& st)
+	{
+		PlayerFlags flags;
+		if (st.listed) flags = FlagsFor(st.admin, false, {}, st.proven);
+		if (ProofHoldOn(st.listed && st.admin, st.secret, st.proven, st.tool, st.recorded, st.age)) flags = HoldFlags();
+		return NeedsOwnRules(flags) ? PlayerRulesText(m, flags, true) : RulesText(m, true);
+	};
+	const auto denied = [](const std::string& t) { return t.find("BetterCheats.stack-size=deny") != std::string::npos; };
+
+	const Model none = ParseText({ "[Policy]", "Default=allow" }, dw);
+	const std::string denies = RulesText(none, true);
+	const std::string adminText = PlayerRulesText(none, FlagsFor(true, false, {}, true), true);
+	CHECK(denied(denies) && !denied(adminText) && adminText == "default=allow\n");
+	CHECK(NeedsOwnRules(HoldFlags()) && PlayerRulesText(none, HoldFlags(), true) == adminText);
+
+	// An admin rejoin with a secret: the admin's set from PostLogin, the same text when the check passes,
+	// and no step in between puts a deny on them.
+	{
+		State st{ true, true, true, false, true, true, 0 };
+		CHECK(ProofHoldOn(true, true, false, true, true, 0));
+		CHECK(sent(none, st) == adminText);
+		st.age = kProofHoldMs - 1;
+		CHECK(sent(none, st) == adminText);
+		st.proven = true; st.age = 260;
+		CHECK(sent(none, st) == adminText);                   // the pass: the same text, so the loader is not sent anything new
+		st.age = 60000;
+		CHECK(sent(none, st) == adminText);                   // proven long after: not a hold, the admin's rules
+	}
+
+	// The same property under the other rule shapes: the held text is the proven text.
+	{
+		const Model hostDeny = ParseText({ "[Rules]", "BetterCheats.*=deny" }, dw);
+		const Model adminsRow = ParseText({ "[Rules]", "BetterCheats.stack-size=admins", "P.f=deny" }, dw);
+		const Model closed = ParseText({ "[Policy]", "Default=deny" }, dw);
+		for (const Model* m : { &hostDeny, &adminsRow, &closed })
+		{
+			State held{ true, true, true, false, true, true, 100 }, proven = held;
+			proven.proven = true;
+			CHECK(sent(*m, held) == sent(*m, proven));
+		}
+		CHECK(PlayerRulesText(closed, FlagsFor(true, false, {}, true), true) == "default=deny\n");   // T3
+		CHECK(!DefaultRowAdminsOnly(closed, "BetterCheats") && DefaultRowAdminsOnly(none, "BetterCheats"));
+		CHECK(!DefaultRowAdminsOnly(hostDeny, "bettercheats") && DefaultRowAdminsOnly(hostDeny, "Best Builder"));
+		CHECK(DefaultRowAdminsOnly(adminsRow, "BetterCheats"));
+	}
+
+	// The first join during `admin pair`: no secret yet, so no hold and the denies; once paired and proven, the allows.
+	{
+		IgaEnv e; e.path = path; e.admins = { "p1" };
+		auto s = MakeIga(e);
+		State st{ true, true, s->HasSecret("p1"), false, true, false, 0 };
+		CHECK(!st.secret && !ProofHoldOn(true, st.secret, false, true, true, 0));
+		CHECK(denied(sent(none, st)));
+		std::string code, err;
+		CHECK(s->IssueCode("p1", code, err));
+		CHECK(IgaChallenge(*s, 1, "p1") != "");
+		CHECK(IgaRole(IgaSend(*s, 1, "p1", IgaPair(code, kSecretA))) == "admin");
+		st.secret = s->HasSecret("p1"); st.proven = s->IsProvenAs(1, "p1");
+		CHECK(st.secret && st.proven && sent(none, st) == adminText);
+
+		// A rejoin now: a secret is on file, so the hold applies until the check passes.
+		State again{ true, true, s->HasSecret("p1"), s->IsProvenAs(2, "p1"), true, true, 0 };
+		CHECK(!again.proven && sent(none, again) == adminText);
+
+		// A failed check: the wrong secret never proves, the hold lasts to the limit and then the denies.
+		CHECK(IgaChallenge(*s, 2, "p1") != "");
+		AdminWire::Message bad; bad.tag = AdminWire::Tag::Prove; bad.proof = std::string(64, '0');
+		IgaSend(*s, 2, "p1", bad);
+		again.proven = s->IsProvenAs(2, "p1");
+		CHECK(!again.proven);
+		again.age = kProofHoldMs - 1;
+		CHECK(sent(none, again) == adminText);
+		again.age = kProofHoldMs;
+		CHECK(denied(sent(none, again)));                      // the timeout ends on the denies
+		again.age = kProofHoldMs + 5000;
+		CHECK(denied(sent(none, again)));
+		std::filesystem::remove(path);
+	}
+
+	// A client without the ServerUtility client part can never prove: no hold, the denies.
+	{
+		State st{ true, true, true, false, false, true, 0 };
+		CHECK(!ProofHoldOn(true, true, false, false, true, 0) && denied(sent(none, st)));
+	}
+
+	// No hold was recorded for the connection (no ID at PostLogin, no connection to send on): the denies, never the allows.
+	{
+		State st{ true, true, true, false, true, false, 0 };
+		CHECK(!ProofHoldOn(true, true, false, true, false, 0) && denied(sent(none, st)));
+	}
+
+	// `admin remove` mid-hold and after: not a listed admin any more, so the denies and the hold is over.
+	{
+		State mid{ false, false, true, false, true, true, 2000 };
+		CHECK(!ProofHoldOn(false, true, false, true, true, 2000) && denied(sent(none, mid)));
+		State after = mid; after.age = 30000; after.recorded = false;
+		CHECK(denied(sent(none, after)));
+		State listedNotAdmin{ true, false, true, false, true, true, 100 };   // still listed, Admin flag taken off
+		CHECK(denied(sent(none, listedNotAdmin)));
+	}
+
+	// A rules reload during the hold: the held text follows the new model; after it, the proven text does.
+	{
+		const Model reloaded = ParseText({ "[Rules]", "BetterCheats.*=deny" }, dw);
+		State st{ true, true, true, false, true, true, 3000 };
+		CHECK(sent(none, st) == "default=allow\n");
+		CHECK(sent(reloaded, st) == "default=allow\nBetterCheats.*=deny\n");
+		st.proven = true; st.age = 20000;
+		CHECK(sent(reloaded, st) == "default=allow\nBetterCheats.*=deny\n");
+		State ended{ true, true, true, false, true, true, kProofHoldMs + 1 };
+		CHECK(sent(reloaded, ended) == RulesText(reloaded, true));
+	}
+
+	// A non-admin: never held, the denies at once, at every moment and whatever else is true.
+	{
+		for (unsigned long long age : { 0ull, 1000ull, kProofHoldMs - 1, kProofHoldMs, 60000ull })
+			for (int secret = 0; secret < 2; ++secret)
+				for (int tool = 0; tool < 2; ++tool)
+				{
+					State unlisted{ false, false, secret != 0, false, tool != 0, true, age };
+					State listedPlain{ true, false, secret != 0, false, tool != 0, true, age };
+					CHECK(!ProofHoldOn(false, secret != 0, false, tool != 0, true, age) && denied(sent(none, unlisted)));
+					CHECK(denied(sent(none, listedPlain)));
+				}
+	}
+}
+
 int main()
 {
 	std::vector<std::string> w;
@@ -1614,6 +1753,7 @@ int main()
 	InGameAdminTests();
 	InGameAdminOpsTests();
 	ProofGateTests();
+	ProofHoldTests();
 
 	// Mod names with single inner spaces, as the mod loader allows them.
 	{
@@ -1852,7 +1992,7 @@ int main()
 		// An unknown value is still refused, with the new wording.
 		aw.clear();
 		Model bad = ParseText({ "[Rules]", "A.b=sometimes" }, aw);
-		CHECK(bad.rules.empty() && aw.size() == 1);
+		CHECK(bad.rules.empty() && aw.size() == 1 && aw[0].find("allow, deny or admins") != std::string::npos);
 		// Old file: only allow and deny. It loads the same as before.
 		aw.clear();
 		Model old = ParseText({ "[Rules]", "A.b=deny", "C.d=allow" }, aw);
@@ -1868,8 +2008,12 @@ int main()
 		aw.clear();
 		Model own = ParseText({ "[Rules]", "ServerUtility.admin-window=deny", "serverutility.*=admins", "P.f=deny" }, aw);
 		PlayerFlags adm2; adm2.admin = true;
-		CHECK(RulesText(own, true).find("erverUtility") == std::string::npos && RulesText(own, true).find("P.f=deny\n") != std::string::npos);
-		CHECK(PlayerRulesText(own, adm2, true).find("erverUtility") == std::string::npos);
+		const auto lowered = [](std::string t) { for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return t; };
+		CHECK(own.rules.size() >= 1 && lowered(RulesText(own, true)).find("serverutility") == std::string::npos && RulesText(own, true).find("P.f=deny\n") != std::string::npos);
+		CHECK(lowered(PlayerRulesText(own, adm2, true)).find("serverutility") == std::string::npos);
+		// The same row for a plugin the loader rules: the lowercase check above would catch it.
+		Model other = ParseText({ "[Rules]", "serverother.*=admins", "P.f=deny" }, aw);
+		CHECK(lowered(RulesText(other, true)).find("serverother") != std::string::npos);
 	}
 
 	// Records are kept per connection: two connections that read the same ID, one

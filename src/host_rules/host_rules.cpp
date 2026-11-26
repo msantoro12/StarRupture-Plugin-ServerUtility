@@ -334,8 +334,13 @@ namespace
 			return;
 
 		const std::string id = IdOf(playerController);
+		if (id.empty())
+		{
+			LOG_INFO("[HostRules] A joining player's ID is not readable yet - no join hold for them");
+			return;
+		}
 		PlayerList::Entry entry;
-		if (id.empty() || !PlayerList::Find(id, entry) || !entry.admin || !InGameAdmin::HasSecret(id))
+		if (!PlayerList::Find(id, entry) || !entry.admin || !InGameAdmin::HasSecret(id))
 			return;
 
 		std::string text;

@@ -71,6 +71,47 @@ namespace KnownFeatures
 			return n;
 		}
 
+		// The pre-release part of a version: what follows the first '-', up to a '+'.
+		// Empty when there is none.
+		std::string PreRelease(const std::string& v)
+		{
+			const size_t at = v.find_first_of("-+");
+			if (at == std::string::npos || v[at] == '+') return std::string();
+			const size_t end = v.find('+', at);
+			return v.substr(at + 1, end == std::string::npos ? std::string::npos : end - at - 1);
+		}
+
+		bool AllDigits(const std::string& s)
+		{
+			return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+		}
+
+		// SemVer 2.0.0 section 11 on two pre-release parts, both non-empty: identifiers
+		// split on '.', numbers by value, a number below text, text by byte, and when
+		// all else is equal the shorter list is lower.
+		int ComparePreRelease(const std::string& a, const std::string& b)
+		{
+			const std::vector<std::string> x = AdminWire::Split(a, '.'), y = AdminWire::Split(b, '.');
+			for (size_t i = 0; i < x.size() && i < y.size(); ++i)
+			{
+				const bool nx = AllDigits(x[i]), ny = AllDigits(y[i]);
+				int c;
+				if (nx && ny)
+				{
+					const size_t zx = x[i].find_first_not_of('0'), zy = y[i].find_first_not_of('0');
+					const std::string px = zx == std::string::npos ? std::string() : x[i].substr(zx);
+					const std::string py = zy == std::string::npos ? std::string() : y[i].substr(zy);
+					c = px.size() != py.size() ? (px.size() < py.size() ? -1 : 1) : px.compare(py);
+				}
+				else if (nx != ny)
+					c = nx ? -1 : 1;
+				else
+					c = x[i].compare(y[i]);
+				if (c != 0) return c < 0 ? -1 : 1;
+			}
+			return x.size() == y.size() ? 0 : (x.size() < y.size() ? -1 : 1);
+		}
+
 		bool ValidDate(const std::string& d)
 		{
 			if (d.size() != 10) return false;
@@ -98,7 +139,26 @@ namespace KnownFeatures
 			const long p = i < x.size() ? x[i] : 0, q = i < y.size() ? y[i] : 0;
 			if (p != q) return p < q ? -1 : 1;
 		}
-		return x.empty() == y.empty() ? 0 : (x.empty() ? -1 : 1);
+		if (x.empty() != y.empty()) return x.empty() ? -1 : 1;
+		if (x.empty()) return 0;
+		const std::string pa = PreRelease(a), pb = PreRelease(b);
+		if (pa.empty() != pb.empty()) return pa.empty() ? 1 : -1;   // a release is above its pre-releases
+		return pa.empty() ? 0 : ComparePreRelease(pa, pb);
+	}
+
+	std::string ModVersion(const std::vector<Entry>& rows)
+	{
+		const Entry* best = nullptr;
+		for (const Entry& e : rows)
+		{
+			if (e.version.empty()) continue;
+			if (!best) { best = &e; continue; }
+			const bool eDecl = e.source == kSourceDeclared, bDecl = best->source == kSourceDeclared;
+			if (eDecl != bDecl) { if (eDecl) best = &e; continue; }
+			if (eDecl && e.lastSeen != best->lastSeen) { if (e.lastSeen > best->lastSeen) best = &e; continue; }
+			if (CompareVersions(e.version, best->version) > 0) best = &e;
+		}
+		return best ? best->version : std::string();
 	}
 
 	std::vector<Report> ParseReportText(const std::string& text, const std::string& build)
@@ -206,7 +266,10 @@ namespace KnownFeatures
 			cur.source = e.source;   // a loader declared what a player had only reported
 			changed = true;
 		}
-		const int cmp = CompareVersions(e.version, cur.version);
+		// A declared row is what an admin's loader is running now, so it replaces the
+		// stored version, older or not. A reported row has no version and only fills in.
+		const bool running = e.source == kSourceDeclared && !e.version.empty() && e.version != cur.version;
+		const int cmp = running ? 1 : CompareVersions(e.version, cur.version);
 		if (cmp > 0)
 		{
 			cur.version = e.version;

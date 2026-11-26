@@ -41,7 +41,9 @@ namespace KnownFeatures
 		std::string source;                // empty = reported
 	};
 
-	// -1, 0 or 1. A leading v and anything from a - or + on are ignored; a
+	// -1, 0 or 1. A leading v is ignored. The numbers compare first; when they are
+	// equal a pre-release (after a -) is below the release and pre-releases follow
+	// SemVer 2.0.0 section 11 (dev.9 < rc.2 < rc.10 < none); a + part is ignored. A
 	// version with no numbers is older than any with some.
 	int CompareVersions(const std::string& a, const std::string& b);
 
@@ -54,10 +56,17 @@ namespace KnownFeatures
 	// skipped; at most kMaxRowsPerReport are read.
 	std::vector<Report> ParseDeclaredRows(const std::vector<std::string>& rows);
 
+	// The version a mod shows: that of its declared row last seen newest, else the
+	// highest by CompareVersions. rows are one plugin's entries; empty when none
+	// has a version.
+	std::string ModVersion(const std::vector<Entry>& rows);
+
 	class Catalog
 	{
 	public:
-		// True when the catalog changed. Rows with a bad plugin name or feature id,
+		// True when the catalog changed. A reported row raises the version to the
+		// newest seen; a declared row (what an admin's loader runs now) sets it, down
+		// as well as up. Rows with a bad plugin name or feature id,
 		// are refused; a new row in a full catalog replaces the reported row with
 		// the oldest lastSeen (declared rows stay, and are refused when all are declared); a title is cut to 80
 		// bytes. today is YYYY-MM-DD. *visible, when given, is set when something a

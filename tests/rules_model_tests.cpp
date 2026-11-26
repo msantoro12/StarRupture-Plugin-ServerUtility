@@ -14,6 +14,7 @@
 #include "host_rules/ingame_admin_model.h"
 #include "admin_wire/admin_wire.h"
 #include "admin_wire/admin_crypto.h"
+#include "client/admin_client.h"   // only its catalog limits are used
 #include "rcon/commands/word_split.h"
 
 #include <cctype>
@@ -738,6 +739,42 @@ static void InGameAdminOpsTests()
 		const auto r = IgaDecode(IgaRaw(*s, 1, "p1", IgaOps(32, 0, mixed)));
 		CHECK(r.size() == 1 && r[0].status == AdminWire::kResultError && !find("Mixed", "f"));
 		std::filesystem::remove(path);
+	}
+
+	// A big catalog push, paced as the admin client sends it (a burst of kCatalogBurstRows, then
+	// kCatalogRowsPerSecond, in messages of at most 48 rows): every row arrives and the request
+	// limit never trips. Sent back to back it does trip, which is why the client paces.
+	{
+		auto run = [&](size_t rowCount, bool paced, std::vector<std::string>& got)
+		{
+			IgaEnv e; e.path = path; e.admins = { "p1" };
+			e.catalogPush = [&](const std::vector<std::string>& rows) { got.insert(got.end(), rows.begin(), rows.end()); };
+			auto s = MakeIga(e);
+			IgaMakeProven(*s, 1, "p1");
+			uint32_t req = 50;
+			size_t at = 0;
+			double budget = AdminClient::kCatalogBurstRows;
+			while (at < rowCount)
+			{
+				const size_t n = std::min<size_t>(std::min<size_t>(48, rowCount - at), paced ? static_cast<size_t>(budget) : 48);
+				if (n == 0) { e.now += 0.25; budget += 0.25 * AdminClient::kCatalogRowsPerSecond; continue; }
+				std::vector<AdminWire::Op> ops;
+				for (size_t i = at; i < at + n; ++i)
+					ops.push_back({ "catalog.push", { "Paced	1.0	f" + std::to_string(i) + "	on	T" } });
+				IgaRaw(*s, 1, "p1", IgaOps(req++, 0, ops));
+				at += n;
+				budget -= static_cast<double>(n);
+			}
+			for (const std::string& line : e.audit)
+				if (line.find("too many requests") != std::string::npos) return true;
+			return false;
+		};
+		std::vector<std::string> got;
+		CHECK(!run(82, true, got) && got.size() == 82);
+		got.clear();
+		CHECK(!run(256, true, got) && got.size() == 256);
+		got.clear();
+		CHECK(run(256, false, got) && got.size() < 256);     // back to back: dropped past the burst
 	}
 
 	// Unmatched-rule warnings stop at the cap with a count of the rest.
@@ -1703,13 +1740,84 @@ int main()
 
 		// Newest version wins (numbers, not text).
 		CHECK(CompareVersions("1.10.0", "1.9.0") > 0 && CompareVersions("v1.2", "1.2.0") == 0);
-		CHECK(CompareVersions("1.2.0-dev.3", "1.2.0") == 0 && CompareVersions("", "0.0.1") < 0);
+		CHECK(CompareVersions("1.2.0-dev.3", "1.2.0") < 0 && CompareVersions("", "0.0.1") < 0);
+
+		// Pre-releases: SemVer order on equal numbers (dev < rc < release), numbers by value.
+		CHECK(CompareVersions("0.26.0-rc.6", "0.26.0-dev.1") > 0 && CompareVersions("0.26.0-dev.1", "0.26.0-rc.6") < 0);
+		CHECK(CompareVersions("0.26.0", "0.26.0-rc.6") > 0 && CompareVersions("0.26.0-rc.6", "0.26.0") < 0);
+		CHECK(CompareVersions("1.0.0-rc.10", "1.0.0-rc.2") > 0 && CompareVersions("1.0.0-rc.9", "1.0.0-rc.10") < 0);
+		CHECK(CompareVersions("1.0.0-dev.9", "1.0.0-dev.10") < 0 && CompareVersions("1.0.0-rc.007", "1.0.0-rc.7") == 0);
+		CHECK(CompareVersions("1.0.0-rc.1", "1.0.0-rc") > 0);                      // the longer list is higher
+		CHECK(CompareVersions("1.0.0-1", "1.0.0-a") < 0);                           // a number is below text
+		CHECK(CompareVersions("v0.11.0-dev.9", "0.11.0-rc.2") < 0);
+		CHECK(CompareVersions("1.2.0+b1", "1.2.0") == 0 && CompareVersions("1.2.0-rc.1+b2", "1.2.0-rc.1") == 0);
+		CHECK(CompareVersions("2.4.0-gss.4", "2.4.0") < 0 && CompareVersions("2.4.0-gss.4", "2.3.9") > 0);
+		CHECK(CompareVersions("0.19.0-rc.4", "0.19.0-rc.4") == 0 && CompareVersions("1.0.0-", "1.0.0") == 0);
 		Catalog v;
 		v.Merge(rep("P", "f", "1.9.0", "", false, "Old title"), d1);
 		CHECK(v.Merge(rep("P", "f", "1.10.0", "", false, "New title"), d1));
 		CHECK(v.Entries()[0].version == "1.10.0" && v.Entries()[0].title == "New title");
 		CHECK(!v.Merge(rep("P", "f", "1.9.5", "", false, "Older title"), d1));
 		CHECK(v.Entries()[0].version == "1.10.0" && v.Entries()[0].title == "New title");
+
+		// A declared row sets the running version, up or down; a reported row only raises it.
+		{
+			auto decl = [&](const char* plugin, const char* id, const char* version, const char* title = "")
+			{
+				Report r = rep(plugin, id, version, "", false, title);
+				r.source = kSourceDeclared;
+				return r;
+			};
+			Catalog dv;
+			bool shown = false;
+			CHECK(dv.Merge(decl("Cheats", "move", "0.26.0-dev.1", "Move"), d1, &shown) && shown);
+			CHECK(dv.Merge(decl("Cheats", "move", "0.26.0-rc.6", "Move now"), d1, &shown) && shown);
+			CHECK(dv.Entries()[0].version == "0.26.0-rc.6" && dv.Entries()[0].title == "Move now");
+			CHECK(!dv.Merge(decl("Cheats", "move", "0.26.0-rc.6", "Move now"), d1, &shown) && !shown);   // same again, same day
+			CHECK(dv.Merge(decl("Cheats", "move", "0.26.0", "Move now"), d1, &shown) && shown);         // a release replaces the rc
+			CHECK(dv.Entries()[0].version == "0.26.0");
+			CHECK(dv.Merge(decl("Cheats", "move", "0.26.0-rc.6", "Move now"), d1, &shown) && shown);    // a downgrade shows
+			CHECK(dv.Entries()[0].version == "0.26.0-rc.6");
+			dv.Merge(decl("Cheats", "move", "", "Move now"), d2, &shown);                              // no version: kept
+			CHECK(!shown && dv.Entries()[0].version == "0.26.0-rc.6");
+
+			// A stored plain version is replaced by the pre-release an untagged build later runs.
+			Catalog dp;
+			dp.Merge(decl("Cam", "zoom", "v0.2.0"), d1);
+			CHECK(dp.Merge(decl("Cam", "zoom", "0.2.0-rc.2"), d1, &shown) && shown && dp.Entries()[0].version == "0.2.0-rc.2");
+
+			// A report (an older pre-release of equal numbers) never lowers it; a newer one raises it.
+			CHECK(!dv.Merge(rep("Cheats", "move", "0.26.0-dev.1", "", false), d1, &shown) && !shown);
+			CHECK(dv.Entries()[0].version == "0.26.0-rc.6");
+			CHECK(dv.Merge(rep("Cheats", "move", "0.26.0", "", false), d1, &shown) && shown && dv.Entries()[0].version == "0.26.0");
+		}
+
+		// Two pushes through the shared catalog, dev then rc: the snapshot shows the rc.
+		{
+			NoteDeclaredRows({ "Stale Probe	0.26.0-dev.1	a	on	A", "Stale Probe	0.26.0-dev.1	b	off	B" });
+			NoteDeclaredRows({ "Stale Probe	0.26.0-rc.6	a	on	A", "Stale Probe	0.26.0-rc.6	b	off	B" });
+			std::vector<Entry> rows;
+			for (const Entry& x : Snapshot()) if (x.plugin == "Stale Probe") rows.push_back(x);
+			CHECK(rows.size() == 2 && rows[0].version == "0.26.0-rc.6" && rows[1].version == "0.26.0-rc.6");
+			CHECK(ModVersion(rows) == "0.26.0-rc.6");
+		}
+
+		// The version a mod shows: the newest declared row wins over a higher leftover; no declared row, the highest.
+		{
+			auto ent = [](const char* version, const std::string& day, const char* source)
+			{
+				Entry x; x.plugin = "P"; x.id = version; x.version = version; x.lastSeen = day; x.source = source;
+				return x;
+			};
+			CHECK(ModVersion({}).empty() && ModVersion({ ent("", d2, "declared") }).empty());
+			// After a downgrade a removed feature's row still holds the higher version, one push older.
+			CHECK(ModVersion({ ent("2.0.0", d1, "declared"), ent("1.9.0", d2, "declared") }) == "1.9.0");
+			CHECK(ModVersion({ ent("1.9.0", d2, "declared"), ent("2.0.0", d1, "declared") }) == "1.9.0");
+			// Same day: the highest of the declared rows. A declared row beats a reported one.
+			CHECK(ModVersion({ ent("1.8.0", d2, "declared"), ent("1.9.0-rc.1", d2, "declared") }) == "1.9.0-rc.1");
+			CHECK(ModVersion({ ent("3.0.0", d2, "reported"), ent("1.0.0", d1, "declared") }) == "1.0.0");
+			CHECK(ModVersion({ ent("1.0.0", d1, "reported"), ent("1.1.0", d1, "reported") }) == "1.1.0");
+		}
 
 		// Off by build accumulates; an on report does not clear it.
 		Catalog b;

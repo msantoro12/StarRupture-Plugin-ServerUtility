@@ -149,6 +149,7 @@ namespace InGameAdmin
 				snap.mins.push_back({ m.plugin, m.version });
 
 			std::map<std::string, size_t> modIndex;   // plugin -> index in snap.mods
+			std::vector<std::vector<KnownFeatures::Entry>> modRows;   // the same order
 			for (const KnownFeatures::Entry& e : KnownFeatures::Snapshot())
 			{
 				const auto it = modIndex.find(e.plugin);
@@ -160,14 +161,16 @@ namespace InGameAdmin
 					AdminWire::ModInfo info;
 					info.plugin = e.plugin;
 					snap.mods.push_back(info);
+					modRows.emplace_back();
 				}
 				else
 					at = it->second;
 				AdminWire::ModInfo& info = snap.mods[at];
-				if (!e.version.empty() && (info.version.empty() || KnownFeatures::CompareVersions(e.version, info.version) > 0))
-					info.version = e.version;
+				modRows[at].push_back(e);
 				info.features.push_back({ e.id, e.title.empty() ? e.id : e.title });
 			}
+			for (size_t i = 0; i < snap.mods.size(); ++i)
+				snap.mods[i].version = KnownFeatures::ModVersion(modRows[i]);
 
 			std::set<std::string> online;
 			SDK::APlayerController* controllers[kMaxControllers] = {};

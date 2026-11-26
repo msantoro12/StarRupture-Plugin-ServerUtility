@@ -124,8 +124,10 @@ namespace RulesModel
 	// join when no list ever arrives, the player is no longer a listed admin, the
 	// check was refused, the client has no ServerUtility client part, or the player
 	// left. Then the player is on the server rules like anyone else, so the
-	// admins-only rows are denied.
-	constexpr unsigned long long kProofHoldMs    = 8000;
+	// admins-only rows are denied. A rules reload does not end the hold: the hold is
+	// checked again and the admin's set is sent again with the new rules. Ending it
+	// there would bring back the off and on switch for a real admin.
+	constexpr unsigned long long kProofHoldMs   = 8000;
 	constexpr unsigned long long kProofHoldCapMs = 30000;
 	constexpr unsigned long long kNoFeatures     = ~0ull;   // "since the feature list": it has not arrived
 

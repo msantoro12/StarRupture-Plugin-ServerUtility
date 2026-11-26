@@ -361,8 +361,9 @@ namespace
 			g_holds.Begin(ref, GetTickCount64());
 			g_ownRules.Ensure(ref) = text;
 		}
-		LOG_INFO("[HostRules] Player %s is a listed admin: the admin's rules apply while the admin check runs (up to %d seconds)",
-		         id.c_str(), static_cast<int>(RulesModel::kProofHoldMs / 1000));
+		LOG_INFO("[HostRules] Player %s is a listed admin: the admin's rules apply while the admin check runs (%d seconds after the feature list arrives, at most %d seconds from the join)",
+		         id.c_str(), static_cast<int>(RulesModel::kProofHoldMs / 1000),
+		         static_cast<int>(RulesModel::kProofHoldCapMs / 1000));
 	}
 
 	void OnClientFeatures(void* playerController)

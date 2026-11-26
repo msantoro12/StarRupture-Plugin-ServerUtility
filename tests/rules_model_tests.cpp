@@ -1163,7 +1163,12 @@ static void ProofHoldTests()
 		CHECK(sent(none, h, 1, t0 + 3000, admin(true, false, true)) == "default=allow\n");
 		CHECK(sent(reloaded, h, 1, t0 + 3100, admin(true, false, true)) == "default=allow\nBetterCheats.*=deny\n");
 		CHECK(sent(reloaded, h, 1, t0 + 20000, admin(true, true, true)) == "default=allow\nBetterCheats.*=deny\n");
-		CHECK(sent(reloaded, h, 1, t0 + 100 + kProofHoldMs + 1, admin(true, false, true)) == RulesText(reloaded, true));
+		// A reload does not end the hold, and the timeout still does: no pass 8 s after the list, so the player is on the server rules.
+		JoinHolds<int> g;
+		g.Begin(1, t0);
+		g.FeaturesArrived(1, t0 + 100);
+		CHECK(sent(reloaded, g, 1, t0 + 3100, admin(true, false, true)) == "default=allow\nBetterCheats.*=deny\n");
+		CHECK(sent(reloaded, g, 1, t0 + 100 + kProofHoldMs + 1, admin(true, false, true)) == RulesText(reloaded, true));
 	}
 
 	// Expired: the connections whose time is up, for the host to look at. Not before, not twice a hold.

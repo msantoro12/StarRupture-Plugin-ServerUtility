@@ -49,6 +49,7 @@ namespace InGameAdmin
 		int                                       g_listener = 0;
 		bool                                      g_handlerRegistered = false;
 		bool                                      g_worldRegistered = false;
+		KnownFeatures::PushGate                   g_catalogGate;   // game thread only
 
 		double NowSeconds()
 		{
@@ -348,8 +349,10 @@ namespace InGameAdmin
 		env.runOps    = &RunOps;
 		env.catalogPush = [](const std::vector<std::string>& rows)
 		{
-			if (KnownFeatures::NoteDeclaredRows(rows))
-				AdminOps::NoteCatalogChanged();   // the mods list only; the ops revision stays
+			// The mods list only; the ops revision stays. A paced batch is many messages, so the
+			// admins are told at most once per KnownFeatures::PushGate::kIntervalMs.
+			if (KnownFeatures::NoteDeclaredRows(rows) && g_catalogGate.Changed(GetTickCount64()))
+				AdminOps::NoteCatalogChanged();
 		};
 
 		auto model = std::make_unique<InGameAdminModel::Server>(env);
@@ -392,9 +395,16 @@ namespace InGameAdmin
 			LOG_INFO("[Admin] In-game admin tool is off ([Policy] InGameAdmin=0)");
 	}
 
+	void Tick(uint64_t nowMs)
+	{
+		if (g_catalogGate.Due(nowMs))
+			AdminOps::NoteCatalogChanged();
+	}
+
 	void Shutdown()
 	{
 		auto* hooks = GetHooks();
+		g_catalogGate = KnownFeatures::PushGate();
 		if (g_listener)
 			AdminOps::RemoveListener(g_listener);
 		g_listener = 0;

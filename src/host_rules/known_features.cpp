@@ -156,6 +156,7 @@ namespace KnownFeatures
 			const bool eDecl = e.source == kSourceDeclared, bDecl = best->source == kSourceDeclared;
 			if (eDecl != bDecl) { if (eDecl) best = &e; continue; }
 			if (eDecl && e.lastSeen != best->lastSeen) { if (e.lastSeen > best->lastSeen) best = &e; continue; }
+			if (eDecl && e.declaredSeq != best->declaredSeq) { if (e.declaredSeq > best->declaredSeq) best = &e; continue; }
 			if (CompareVersions(e.version, best->version) > 0) best = &e;
 		}
 		return best ? best->version : std::string();
@@ -247,6 +248,8 @@ namespace KnownFeatures
 			e.offBuilds.insert(r.build.empty() ? kUnknownBuild : CleanBuild(r.build));
 		e.lastSeen = today;
 		e.source = r.source.empty() ? kSourceReported : Clean(r.source);
+		if (e.source == kSourceDeclared && !m_loading)
+			e.declaredSeq = ++m_declaredSeq;
 
 		const std::string key = Lower(e.plugin + "." + e.id);
 		auto it = m_rows.find(key);
@@ -266,6 +269,8 @@ namespace KnownFeatures
 			cur.source = e.source;   // a loader declared what a player had only reported
 			changed = true;
 		}
+		if (e.declaredSeq != 0)
+			cur.declaredSeq = e.declaredSeq;
 		// A declared row is what an admin's loader is running now, so it replaces the
 		// stored version, older or not. A reported row has no version and only fills in.
 		const bool running = e.source == kSourceDeclared && !e.version.empty() && e.version != cur.version;
@@ -324,6 +329,7 @@ namespace KnownFeatures
 	int Catalog::Parse(const std::string& text)
 	{
 		int skipped = 0;
+		m_loading = true;
 		std::istringstream lines(text);
 		std::string line;
 		bool first = true;
@@ -352,6 +358,7 @@ namespace KnownFeatures
 					Merge(r, f[6]);
 				}
 		}
+		m_loading = false;
 		return skipped;
 	}
 

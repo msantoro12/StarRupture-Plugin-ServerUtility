@@ -25,6 +25,7 @@ namespace KnownFeatures
 		std::set<std::string> offBuilds;   // game builds that reported it off
 		std::string           lastSeen;    // YYYY-MM-DD
 		std::string           source;
+		uint64_t              declaredSeq = 0;   // order this process merged a declared row in (not saved); 0 = none
 	};
 
 	// Limits: rows one client's report may add, and rows the catalog keeps.
@@ -56,8 +57,8 @@ namespace KnownFeatures
 	// skipped; at most kMaxRowsPerReport are read.
 	std::vector<Report> ParseDeclaredRows(const std::vector<std::string>& rows);
 
-	// The version a mod shows: that of its declared row last seen newest, else the
-	// highest by CompareVersions. rows are one plugin's entries; empty when none
+	// The version a mod shows: that of its declared row last seen newest (by date, then by
+	// the order this process merged them), else the highest by CompareVersions. rows are one plugin's entries; empty when none
 	// has a version.
 	std::string ModVersion(const std::vector<Entry>& rows);
 
@@ -89,6 +90,8 @@ namespace KnownFeatures
 		bool EvictOldestReported();
 		std::map<std::string, Entry> m_rows;   // lower-case "plugin.id"
 		std::set<std::string> m_versionWarned;   // lower-case plugin names
+		uint64_t m_declaredSeq = 0;   // the last declaredSeq given out
+		bool     m_loading = false;   // Parse is merging saved rows: they get no declaredSeq
 		std::vector<std::string> m_newVersionWarn;
 	};
 
@@ -101,6 +104,38 @@ namespace KnownFeatures
 		void Wrote(uint64_t nowMs) { m_wrote = true; m_lastMs = nowMs; }
 	private:
 		bool     m_wrote = false;
+		uint64_t m_lastMs = 0;
+	};
+
+	// At most one announcement of a catalog change per interval. The first change goes out at
+	// once; changes inside the interval are held and go out as one when it ends (Due, from the
+	// tick). Not thread safe: one owner (the game thread).
+	class PushGate
+	{
+	public:
+		static constexpr uint64_t kIntervalMs = 1000;
+		// A change happened. True: announce it now.
+		bool Changed(uint64_t nowMs)
+		{
+			if (!m_sent || nowMs - m_lastMs >= kIntervalMs)
+			{
+				m_sent = true; m_lastMs = nowMs; m_held = false;
+				return true;
+			}
+			m_held = true;
+			return false;
+		}
+		// True when a held change is due now.
+		bool Due(uint64_t nowMs)
+		{
+			if (!m_held || nowMs - m_lastMs < kIntervalMs) return false;
+			m_held = false; m_lastMs = nowMs;
+			return true;
+		}
+		bool Held() const { return m_held; }
+	private:
+		bool     m_sent = false;
+		bool     m_held = false;
 		uint64_t m_lastMs = 0;
 	};
 

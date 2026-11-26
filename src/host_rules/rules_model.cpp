@@ -471,10 +471,13 @@ namespace RulesModel
 		return true;
 	}
 
-	bool ProofHoldOn(bool listedAdmin, bool secretOnFile, bool proven, bool clientHasTool,
-	                 bool recorded, unsigned long long heldMs)
+	bool ProofHoldOn(const HoldInputs& in, unsigned long long sinceJoinMs, unsigned long long sinceFeaturesMs)
 	{
-		return recorded && listedAdmin && secretOnFile && clientHasTool && !proven && heldMs < kProofHoldMs;
+		if (!in.listedAdmin || !in.secretOnFile || in.proven || sinceJoinMs >= kProofHoldCapMs)
+			return false;
+		if (sinceFeaturesMs == kNoFeatures)
+			return true;   // the list has not arrived: whether the client part exists is not known yet
+		return in.clientHasTool && sinceFeaturesMs < kProofHoldMs;
 	}
 
 	PlayerFlags HoldFlags()

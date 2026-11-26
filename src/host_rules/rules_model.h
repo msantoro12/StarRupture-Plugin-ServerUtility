@@ -115,6 +115,28 @@ namespace RulesModel
 	// its ID reads now and how long it has been held.
 	HeldStep NextHeldStep(bool alive, bool idRead, unsigned long long heldMs);
 
+	// A listed admin whose admin check is pending gets the admin's rule set at once
+	// (admins-only rows allowed), so they never see those features switch off and
+	// on again at join. The hold is anchored to the join and ends at the first of:
+	// the check passed (the normal set takes over, the same text), it did not pass
+	// within kProofHoldMs, the player is no longer a listed admin, or no check can
+	// come. Then the player is on the server rules like anyone else, so the
+	// admins-only rows are denied.
+	constexpr unsigned long long kProofHoldMs = 8000;
+	// True while the hold applies. listedAdmin: the list entry has Admin. secretOnFile:
+	// the ID has paired before, so the client can answer a challenge by itself (a
+	// first pairing waits for a person to type a code: nothing is pending, no hold).
+	// clientHasTool: the client reported the ServerUtility client part. recorded: a
+	// hold was started for this connection at its join. heldMs: time since then.
+	bool ProofHoldOn(bool listedAdmin, bool secretOnFile, bool proven, bool clientHasTool,
+	                 bool recorded, unsigned long long heldMs);
+	// The flags a held connection gets: the admin's own, nothing else (a proven
+	// admin with ExemptRules or Sections= gets those when the check passes).
+	PlayerFlags HoldFlags();
+	// "Admins only (default)" is true of a built-in default row only while the host's
+	// own rules leave it to admins: not under default=deny and not under a Plugin.*=deny.
+	bool DefaultRowAdminsOnly(const Model& m, const std::string& plugin);
+
 	// Per-connection records, keyed by the connection and never by the player's
 	// ID: two connections can read the same ID (a player and one who copied it),
 	// and when one of them leaves the other keeps its record.

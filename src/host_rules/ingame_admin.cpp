@@ -430,6 +430,12 @@ namespace InGameAdmin
 		return conn && model->IsProvenAs(conn, playerId);
 	}
 
+	bool HasSecret(const std::string& playerId)
+	{
+		const std::shared_ptr<InGameAdminModel::Server> model = ModelPtr();
+		return model && !playerId.empty() && model->HasSecret(playerId);
+	}
+
 	void OnClaimed(void* playerController, const std::string& playerId)
 	{
 		const std::shared_ptr<InGameAdminModel::Server> model = ModelPtr();

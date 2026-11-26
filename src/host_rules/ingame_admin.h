@@ -24,6 +24,9 @@ namespace InGameAdmin
 	// an ID alone is not proof.
 	bool IsProven(void* playerController, const std::string& playerId);
 
+	// True when this ID paired before, so a client with the admin tool can prove by itself.
+	bool HasSecret(const std::string& playerId);
+
 	// The player just completed the admin claim on this controller: that connection
 	// alone may pair without a code.
 	void OnClaimed(void* playerController, const std::string& playerId);

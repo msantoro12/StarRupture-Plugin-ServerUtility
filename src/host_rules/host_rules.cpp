@@ -40,6 +40,7 @@ namespace
 	// By connection, not by ID: two connections can share an ID, and one leaving must not drop the other.
 	RulesModel::PerConnection<ConnRef, Known>       g_known;     // connections whose loader reported (g_mutex)
 	RulesModel::PerConnection<ConnRef, std::string> g_ownRules;  // own rules text last sent to a connection (g_mutex)
+	RulesModel::PerConnection<ConnRef, ULONGLONG>   g_holds;     // admin-check holds: GetTickCount64 at the join (g_mutex)
 
 	std::string PushText(const std::string& text);
 
@@ -121,8 +122,38 @@ namespace
 		// apply only to a connection that proved the pairing secret as this ID.
 		RulesModel::PlayerFlags flags;
 		PlayerList::Entry entry;
-		if (PlayerList::Find(id, entry) && entry.NeedsProof())
-			flags = RulesModel::FlagsFor(entry.admin, entry.exemptRules, entry.sections, InGameAdmin::IsProven(playerController, id));
+		const bool listed = PlayerList::Find(id, entry);
+		const bool proven = listed && entry.NeedsProof() && InGameAdmin::IsProven(playerController, id);
+		if (listed && entry.NeedsProof())
+			flags = RulesModel::FlagsFor(entry.admin, entry.exemptRules, entry.sections, proven);
+
+		// A listed admin whose check is pending, within the join hold, gets the admin's set
+		// (see RulesModel::ProofHoldOn). When the hold is over, whatever the reason, it is dropped.
+		{
+			const ConnRef ref(static_cast<SDK::APlayerController*>(playerController));
+			ULONGLONG since = 0;
+			bool recorded = false;
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				if (const ULONGLONG* at = g_holds.Find(ref)) { recorded = true; since = *at; }
+			}
+			if (recorded)
+			{
+				const bool toolThere = hooks->Network && GetSelf() && hooks->Network->IsClientReady(playerController, GetSelf());
+				const ULONGLONG age = GetTickCount64() - since;
+				if (RulesModel::ProofHoldOn(listed && entry.admin, InGameAdmin::HasSecret(id), proven, toolThere, true, age))
+					flags = RulesModel::HoldFlags();
+				else
+				{
+					{
+						std::lock_guard<std::mutex> lk(g_mutex);
+						g_holds.Erase(ref);
+					}
+					if (!proven)
+						LOG_INFO("[HostRules] Player %s: the admin check is over without a pass - the server rules apply", id.c_str());
+				}
+			}
+		}
 
 		const bool needsOwn = RulesModel::NeedsOwnRules(flags);
 		std::string text, last;
@@ -166,9 +197,40 @@ namespace
 			LOG_WARN("[HostRules] Could not send rules for player %s: %s", id.c_str(), err);
 	}
 
+	// Game thread. A hold that ran out is ended here: the connection goes back to the
+	// server rules unless the check passed in the meantime.
+	void EndExpiredHolds(ULONGLONG now)
+	{
+		std::vector<ConnRef> due;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			for (const auto& row : g_holds.rows)
+				if (now - row.value >= RulesModel::kProofHoldMs)
+					due.push_back(row.key);
+		}
+		for (const ConnRef& ref : due)
+		{
+			SDK::APlayerController* pc = ref.Get();
+			const std::string id = pc ? IdOf(pc) : std::string();
+			if (!pc || id.empty())
+			{
+				auto* hooks = GetHooks();
+				if (pc && hooks && hooks->HostRules)
+					hooks->HostRules->ClearConnection(pc);
+				std::lock_guard<std::mutex> lk(g_mutex);
+				g_holds.Erase(ref);
+				g_ownRules.Erase(ref);
+				continue;
+			}
+			ApplyRules(pc, id, false);
+		}
+	}
+
 	void OnTick(float)
 	{
-		KnownFeatures::Tick(GetTickCount64());
+		const ULONGLONG tickNow = GetTickCount64();
+		KnownFeatures::Tick(tickNow);
+		EndExpiredHolds(tickNow);
 		if (g_waiting.empty())
 			return;
 
@@ -257,6 +319,46 @@ namespace
 		}
 	}
 
+	// The player's controller exists and the ID reads, but the loader's feature list has not
+	// arrived. The loader sends the global rules the moment that list does, before any plugin is
+	// told, so a listed admin with a secret on file gets the admin's set now: the first rules their
+	// client applies are then the final ones. Without it (no ID yet, no connection) nothing changes:
+	// the rules go out as before and the admin's set follows once the check passes.
+	void OnPlayerJoined(void* playerController)
+	{
+		if (!OnGameThread() || !playerController)
+			return;
+		auto* hooks = GetHooks();
+		IPluginHostRules* api = hooks ? hooks->HostRules : nullptr;
+		if (!api || !InGameAdmin::Enabled())
+			return;
+
+		const std::string id = IdOf(playerController);
+		PlayerList::Entry entry;
+		if (id.empty() || !PlayerList::Find(id, entry) || !entry.admin || !InGameAdmin::HasSecret(id))
+			return;
+
+		std::string text;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			text = RulesModel::PlayerRulesText(g_model, RulesModel::HoldFlags(), true);
+		}
+		char err[256] = {};
+		if (!api->SetRulesForConnection(playerController, text.c_str(), err, sizeof(err)))
+		{
+			LOG_DEBUG("[HostRules] No join hold for player %s: %s", id.c_str(), err);
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			const ConnRef ref(static_cast<SDK::APlayerController*>(playerController));
+			g_holds.Ensure(ref) = GetTickCount64();
+			g_ownRules.Ensure(ref) = text;
+		}
+		LOG_INFO("[HostRules] Player %s is a listed admin: the admin's rules apply while the admin check runs (up to %d seconds)",
+		         id.c_str(), static_cast<int>(RulesModel::kProofHoldMs / 1000));
+	}
+
 	void OnClientFeatures(void* playerController)
 	{
 		if (!OnGameThread())
@@ -293,6 +395,7 @@ namespace
 			const ConnRef ref(pc);
 			g_known.Erase(ref);
 			g_ownRules.Erase(ref);
+			g_holds.Erase(ref);
 		}
 
 		const std::string id = IdOf(exitingController);
@@ -427,7 +530,10 @@ namespace HostRules
 		}
 		auto* hooks2 = GetHooks();
 		if (hooks2 && hooks2->Players)
+		{
+			hooks2->Players->RegisterOnPlayerJoined(OnPlayerJoined);
 			hooks2->Players->RegisterOnPlayerLeft(OnPlayerLeft);
+		}
 	}
 
 	int ConnectedControllers(SDK::APlayerController** out, int max)
@@ -466,7 +572,10 @@ namespace HostRules
 		g_waiting.clear();
 		KnownFeatures::Flush();
 		if (hooks->Players)
+		{
+			hooks->Players->UnregisterOnPlayerJoined(OnPlayerJoined);
 			hooks->Players->UnregisterOnPlayerLeft(OnPlayerLeft);
+		}
 	}
 
 	bool Reload(std::string& error)

@@ -742,7 +742,7 @@ static void InGameAdminOpsTests()
 	}
 
 	// A big catalog push, paced as the admin client sends it (a burst of kCatalogBurstRows, then
-	// kCatalogRowsPerSecond, in messages of at most 48 rows): every row arrives and the request
+	// kCatalogRowsPerSecond, in messages of about ten rows, what fits kMaxMessage): every row arrives and the request
 	// limit never trips. Sent back to back it does trip, which is why the client paces.
 	{
 		auto run = [&](size_t rowCount, bool paced, std::vector<std::string>& got)
@@ -756,7 +756,7 @@ static void InGameAdminOpsTests()
 			double budget = AdminClient::kCatalogBurstRows;
 			while (at < rowCount)
 			{
-				const size_t n = std::min<size_t>(std::min<size_t>(48, rowCount - at), paced ? static_cast<size_t>(budget) : 48);
+				const size_t n = std::min<size_t>(std::min<size_t>(10, rowCount - at), paced ? static_cast<size_t>(budget) : 10);
 				if (n == 0) { e.now += 0.25; budget += 0.25 * AdminClient::kCatalogRowsPerSecond; continue; }
 				std::vector<AdminWire::Op> ops;
 				for (size_t i = at; i < at + n; ++i)

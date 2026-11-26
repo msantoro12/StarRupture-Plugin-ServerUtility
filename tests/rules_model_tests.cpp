@@ -51,6 +51,7 @@ namespace
 		std::set<std::string> admins;
 		std::set<std::string> rulesFlagged;   // IDs with ExemptRules or Sections= but no Admin
 		int proofChanges = 0;
+		std::vector<uint64_t> rejected;   // connections whose proof was refused, in order
 		double now = 1000;
 		bool on = true;
 		std::vector<std::string> audit;
@@ -69,6 +70,7 @@ namespace
 		env.isAdmin = [&e](const std::string& id) { return e.admins.count(id) > 0; };
 		env.canProve = [&e](const std::string& id) { return e.rulesFlagged.count(id) > 0; };
 		env.proofChanged = [&e] { ++e.proofChanges; };
+		env.proofRejected = [&e](uint64_t conn) { e.rejected.push_back(conn); };
 		env.revision = [] { return 7u; };
 		env.now = [&e] { return e.now; };
 		env.audit = [&e](const std::string& line) { e.audit.push_back(line); };
@@ -967,16 +969,35 @@ static void ProofHoldTests()
 		State again{ true, true, s->HasSecret("p1"), s->IsProvenAs(2, "p1"), true, true, 0 };
 		CHECK(!again.proven && sent(none, again) == adminText);
 
-		// A failed check: the wrong secret never proves, the hold lasts to the limit and then the denies.
+		// A failed check: the wrong secret never proves. The server refuses the proof, which tells the host,
+		// and the host ends the hold at once (EndAdminHold erases it): the denies, long before the limit.
 		CHECK(IgaChallenge(*s, 2, "p1") != "");
+		CHECK(e.rejected.empty());
 		AdminWire::Message bad; bad.tag = AdminWire::Tag::Prove; bad.proof = std::string(64, '0');
 		IgaSend(*s, 2, "p1", bad);
 		again.proven = s->IsProvenAs(2, "p1");
 		CHECK(!again.proven);
-		again.age = kProofHoldMs - 1;
+		CHECK(e.rejected.size() == 1 && e.rejected[0] == 2);
+		again.recorded = false;                                // what EndAdminHold does to the hold
+		again.age = 40;
+		CHECK(denied(sent(none, again)));
+		// The same refusal for a proof with no challenge behind it, and one that is empty.
+		IgaSend(*s, 2, "p1", bad);
+		CHECK(e.rejected.size() == 2);
+		AdminWire::Message empty; empty.tag = AdminWire::Tag::Prove;
+		CHECK(IgaChallenge(*s, 2, "p1") != "");
+		IgaSend(*s, 2, "p1", empty);
+		CHECK(e.rejected.size() == 3 && e.rejected[2] == 2);
+		// A right proof is not refused.
+		AdminWire::Message good; good.tag = AdminWire::Tag::Prove;
+		AdminCrypto::MakeProof(kSecretA, IgaChallenge(*s, 3, "p1"), s->ServerId(), good.proof);
+		CHECK(IgaRole(IgaSend(*s, 3, "p1", good)) == "admin");
+		CHECK(e.rejected.size() == 3);
+		// Without the early end the hold still runs to the limit and then ends on the denies.
+		again.recorded = true; again.age = kProofHoldMs - 1;
 		CHECK(sent(none, again) == adminText);
 		again.age = kProofHoldMs;
-		CHECK(denied(sent(none, again)));                      // the timeout ends on the denies
+		CHECK(denied(sent(none, again)));
 		again.age = kProofHoldMs + 5000;
 		CHECK(denied(sent(none, again)));
 		std::filesystem::remove(path);

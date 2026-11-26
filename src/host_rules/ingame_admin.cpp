@@ -325,6 +325,18 @@ namespace InGameAdmin
 		env.isAdmin   = [](const std::string& id) { PlayerList::Entry e; return PlayerList::Find(id, e) && e.admin; };
 		env.canProve  = [](const std::string& id) { PlayerList::Entry e; return PlayerList::Find(id, e) && e.NeedsProof(); };
 		env.proofChanged = [] { HostRules::RefreshPlayers(); };
+		env.proofRejected = [](ConnId conn)
+		{
+			ObjectRef<SDK::APlayerController> ref;
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				const auto it = std::find_if(g_conns.begin(), g_conns.end(), [&](const Connection& c) { return c.id == conn; });
+				if (it == g_conns.end()) return;
+				ref = it->ref;
+			}
+			if (SDK::APlayerController* pc = ref.Get())
+				HostRules::EndAdminHold(pc);
+		};
 		env.revision  = [] { return static_cast<uint32_t>(AdminOps::Revision()); };
 		env.now       = &NowSeconds;
 		env.audit     = [](const std::string& line) { LOG_INFO("%s", line.c_str()); };

@@ -564,6 +564,24 @@ namespace HostRules
 			hooks->Engine->PostToGameThread(RefreshNow, nullptr);
 	}
 
+	void EndAdminHold(void* playerController)
+	{
+		if (!OnGameThread() || !playerController)
+			return;
+		const std::string id = IdOf(playerController);
+		if (id.empty())
+			return;   // the hold runs out by itself
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			const ConnRef ref(static_cast<SDK::APlayerController*>(playerController));
+			if (!g_holds.Find(ref))
+				return;
+			g_holds.Erase(ref);
+		}
+		LOG_INFO("[HostRules] Player %s: the admin check failed - the server rules apply", id.c_str());
+		ApplyRules(playerController, id, false);
+	}
+
 	void Shutdown()
 	{
 		auto* hooks = GetHooks();

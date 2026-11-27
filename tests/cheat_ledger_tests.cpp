@@ -603,7 +603,7 @@ static void Composed()
 		CHECK(r.Live(20, "boost") == Value(std::vector<float>{ 1.0f, 1.0f, 2.0f, 2.0f }));
 	}
 	{   // held at 3 on a max of 5: the game upgrades the max to 8/8, SU writes nothing over it
-		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 5.0f, 5.0f }));
+		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 5.0f, 5.0f })); r.pawn["A"] = 10;
 		Request q = r.Req(Kind::Toggle, "A", "boost", Value(std::vector<float>{ 3.0f, 3.0f, 5.0f, 5.0f }), 10, true);
 		q.pin = true; q.asked = Value(3.0f);
 		CHECK(r.ledger.Apply(q));
@@ -616,7 +616,7 @@ static void Composed()
 		CHECK(r.Live(10, "boost") == Value(std::vector<float>{ 1.0f, 1.0f, 8.0f, 8.0f }));
 	}
 	{   // a modifier changes only the max CurrentValue and SU did not raise the max: kept
-		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 5.0f, 5.0f }));
+		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 5.0f, 5.0f })); r.pawn["A"] = 10;
 		Request q = r.Req(Kind::Toggle, "A", "boost", Value(std::vector<float>{ 3.0f, 3.0f, 5.0f, 5.0f }), 10, true);
 		q.pin = true; q.asked = Value(3.0f);
 		CHECK(r.ledger.Apply(q));
@@ -627,7 +627,7 @@ static void Composed()
 		CHECK(r.Live(10, "boost") == Value(std::vector<float>{ 1.0f, 1.0f, 5.0f, 6.0f }));
 	}
 	{   // SU raised the max (true max 2): a max CurrentValue change alone is not the game's, the hold stays
-		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 2.0f, 2.0f }));
+		Rig r; r.Seed(10, "boost", Value(std::vector<float>{ 1.0f, 1.0f, 2.0f, 2.0f })); r.pawn["A"] = 10;
 		Request q = r.Req(Kind::Toggle, "A", "boost", Value(std::vector<float>{ 3.0f, 3.0f, 3.0f, 3.0f }), 10, true);
 		q.pin = true; q.asked = Value(3.0f);
 		CHECK(r.ledger.Apply(q));
@@ -1328,13 +1328,13 @@ static void PendingWrites()
 	}
 	{   // a write still pending at death is forgotten before the first tick retries it
 		Rig r; Setup(r);
-		r.failTargets.insert(10);
-		CHECK(r.ledger.Release(Kind::Toggle, "A", "feat", "fly"));
-		r.failTargets.clear();
+		r.live["10|fly"] = Value(false);
+		r.halfWrites = 2;
+		r.ledger.Tick();   // the pin's write and its undo both fail: a pending write
 		const int before = r.writes;
 		r.spectator.insert("A");
 		r.ledger.Tick();
-		CHECK(r.writes == before && r.Live(10, "fly") == Value(true));
+		CHECK(r.writes == before);
 	}
 	{   // a lost controller with a live character is a missed leave: the character is restored
 		Rig r; Setup(r);

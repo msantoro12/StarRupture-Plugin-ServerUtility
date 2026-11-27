@@ -194,7 +194,6 @@ static int PatchClassPolicy(SDK::UCrReplicationGraph* graph, SDK::UClass* cls, u
 
 	return changed;
 }
-}
 
 // ---------------------------------------------------------------------------
 // The two halves

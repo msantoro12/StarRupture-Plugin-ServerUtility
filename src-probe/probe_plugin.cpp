@@ -240,11 +240,243 @@ namespace
 		c.controller = game ? ControllerOf_SEH(self) : nullptr;
 	}
 
-	void LogCall(int fn, void* self, const char* extra)
+	void LogCallNamed(const char* name, void* self, const char* extra)
 	{
 		Ctx c;
 		Describe(self, c);
-		AppendF("%s thread=%s this=%p class=%s owner=%p %s", g_rows[fn]->name, c.thread, self, c.cls, c.controller, extra);
+		AppendF("%s thread=%s this=%p class=%s owner=%p %s", name, c.thread, self, c.cls, c.controller, extra);
+	}
+
+	void LogCall(int fn, void* self, const char* extra) { LogCallNamed(g_rows[fn]->name, self, extra); }
+
+	// ---- Exec-thunk hooks (reflected UFunctions, found through the loader's object walker). ----
+
+	struct ThunkRow
+	{
+		const char* cls;
+		const char* fn;
+		void*       detour;
+		void**      original;
+		uintptr_t   address = 0;
+		HookHandle  handle = nullptr;
+		std::atomic<uint32_t> total{ 0 };
+		std::atomic<uint32_t> sinceSummary{ 0 };
+		std::string name;
+		ThunkRow(const char* c, const char* f, void* d, void** o) : cls(c), fn(f), detour(d), original(o), name(std::string(c) + "::" + f) {}
+	};
+
+	std::vector<ThunkRow*> g_thunks;
+	std::atomic<bool> g_thunksInstalled{ false };
+
+	bool FullT(ThunkRow& r)
+	{
+		const uint32_t n = r.total.fetch_add(1) + 1;
+		if (n <= kFullCalls) return true;
+		r.sinceSummary.fetch_add(1);
+		return false;
+	}
+
+	using ThunkFn = void(__fastcall*)(void* context, void* frame, void* result);
+	ThunkFn o_Viewport = nullptr, o_Destruct = nullptr, o_Spawn = nullptr;
+	enum Th : int { T_Viewport, T_Destruct, T_Spawn };
+
+	// Reads a reflected object-pointer member by name (no compiled offset). Null when unavailable.
+	void* ReadObjectProp_SEH(void* object, const char* name)
+	{
+		__try
+		{
+			IPluginHooks* hooks = GetHooks();
+			if (!object || !hooks || !hooks->ObjectProperties || !hooks->ObjectProperties->IsReady()) return nullptr;
+			PluginPropertyHandle p = hooks->ObjectProperties->FindPropertyOnObject(object, name);
+			void* value = nullptr;
+			if (!p || !hooks->ObjectProperties->GetObjectProperty(object, p, &value)) return nullptr;
+			return value;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+	}
+
+	void* OuterOf_SEH(void* object)
+	{
+		__try
+		{
+			SDK::UObject** outer = object ? ServerUtilityFields::ObjectOuter.In(object) : nullptr;
+			return outer ? *outer : nullptr;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+	}
+
+	// One line per call: thread, this, component class, owning actor class (the component's outer),
+	// the owning controller pointer, the helper actor class the component currently holds.
+	void LogBuildThunk(ThunkRow& r, void* ctx)
+	{
+		void* owner = OuterOf_SEH(ctx);
+		char oc[96]; ClassName(owner, oc, sizeof(oc));
+		void* helper = ReadObjectProp_SEH(ctx, "HelperActor");
+		char hc[96]; ClassName(helper, hc, sizeof(hc));
+		char e[256]; sprintf_s(e, "ownerActor=%p ownerActorClass=%s helper=%p helperClass=%s", owner, oc, helper, hc);
+		LogCallNamed(r.name.c_str(), ctx, e);
+	}
+
+	// ---- Inventory checksum around ServerSpawnActorFromSubsystem. ----
+
+	constexpr size_t kSlotBytes = 0x24;       // FCrInventorySlot; only the hash window, the array is read by reflection
+	constexpr size_t kHashCap   = 64 * 1024;
+	constexpr int    kMaxInv    = 512;
+	std::atomic<bool> g_invMissLogged{ false };
+
+	struct InvSnap { void* comp; int32_t num; uint64_t fnv; uint64_t dwordSum; bool ok; };
+
+	void Hash_SEH(void* comp, InvSnap& s)
+	{
+		s.num = 0; s.fnv = 0; s.dwordSum = 0; s.ok = false;
+		__try
+		{
+			IPluginHooks* hooks = GetHooks();
+			PluginPropertyHandle p = hooks->ObjectProperties->FindPropertyOnObject(comp, "Slots");
+			if (!p) return;
+			struct RawArray { uint8_t* data; int32_t num; int32_t max; };
+			const RawArray* a = static_cast<const RawArray*>(hooks->ObjectProperties->GetPropertyRawPtr(comp, p));
+			if (!a) return;
+			s.num = a->num;
+			size_t bytes = static_cast<size_t>(a->num > 0 ? a->num : 0) * kSlotBytes;
+			if (bytes > kHashCap) bytes = kHashCap;
+			uint64_t h = 1469598103934665603ull;
+			for (size_t i = 0; a->data && i < bytes; ++i) { h ^= a->data[i]; h *= 1099511628211ull; }
+			for (size_t i = 0; a->data && i + 4 <= bytes; i += 4) s.dwordSum += *reinterpret_cast<const uint32_t*>(a->data + i);
+			s.fnv = h; s.ok = true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { s.ok = false; }
+	}
+
+	bool ChainHas_SEH(void* obj, void* a, void* b)
+	{
+		__try
+		{
+			SDK::UObject* cur = static_cast<SDK::UObject*>(obj);
+			for (int hop = 0; cur && hop < 6; ++hop)
+			{
+				if ((a && cur == a) || (b && cur == b)) return true;
+				SDK::UObject** outer = ServerUtilityFields::ObjectOuter.In(cur);
+				cur = outer ? *outer : nullptr;
+			}
+			return false;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+
+	// Inventory components under the placing player's controller or pawn.
+	void FindPlayerInventories(void* component, std::vector<InvSnap>& out, int& scanned)
+	{
+		scanned = 0;
+		IPluginHooks* hooks = GetHooks();
+		if (!hooks || !hooks->ObjectWalker || !hooks->ObjectWalker->IsReady() || !hooks->ObjectProperties || !hooks->ObjectProperties->IsReady()) return;
+		void* controller = ControllerOf_SEH(component);
+		if (!controller) return;
+		void* pawn = ReadObjectProp_SEH(controller, "Pawn");
+		std::vector<PluginObjectInfo> buf(kMaxInv);
+		const int found = hooks->ObjectWalker->FindObjectsByClassNameInto("CrInventoryComponent", PluginObjectLookup_InstanceOnly, buf.data(), kMaxInv);
+		scanned = found;
+		for (int i = 0; i < found && i < kMaxInv; ++i)
+			if (ChainHas_SEH(buf[i].object, controller, pawn))
+				out.push_back(InvSnap{ buf[i].object, 0, 0, 0, false });
+	}
+
+	void LogInv(const char* tag, std::vector<InvSnap>& v)
+	{
+		for (InvSnap& s : v)
+		{
+			Hash_SEH(s.comp, s);
+			AppendF("  inventory %s comp=%p slots=%d fnv=%016llX dwordSum=%llu%s", tag, s.comp, s.num,
+				static_cast<unsigned long long>(s.fnv), static_cast<unsigned long long>(s.dwordSum), s.ok ? "" : " (Slots unreadable)");
+		}
+	}
+
+	// ---- Thunk detours: the original always runs with untouched arguments. ----
+
+	void __fastcall D_Viewport(void* ctx, void* frame, void* result)
+	{
+		if (!g_shutdown && FullT(*g_thunks[T_Viewport])) LogBuildThunk(*g_thunks[T_Viewport], ctx);
+		o_Viewport(ctx, frame, result);
+	}
+
+	void __fastcall D_Destruct(void* ctx, void* frame, void* result)
+	{
+		if (!g_shutdown && FullT(*g_thunks[T_Destruct])) LogBuildThunk(*g_thunks[T_Destruct], ctx);
+		o_Destruct(ctx, frame, result);
+	}
+
+	void __fastcall D_Spawn(void* ctx, void* frame, void* result)
+	{
+		ThunkRow& r = *g_thunks[T_Spawn];
+		std::vector<InvSnap> inv;
+		bool full = false;
+		if (!g_shutdown && FullT(r))
+		{
+			full = true;
+			LogBuildThunk(r, ctx);
+			if (OnGameThread())
+			{
+				int scanned = 0;
+				FindPlayerInventories(ctx, inv, scanned);
+				AppendF("  inventories found for the placing player: %zu (of %d scanned)", inv.size(), scanned);
+				if (inv.empty() && !g_invMissLogged.exchange(true))
+					Append("  cost check: no inventory component resolved for the placing player");
+				LogInv("before", inv);
+			}
+		}
+		o_Spawn(ctx, frame, result);
+		if (full && !inv.empty()) LogInv("after ", inv);
+	}
+
+	void BuildThunks()
+	{
+		if (!g_thunks.empty()) return;
+		g_thunks.push_back(new ThunkRow("CrBuildingComponent", "ServerHandleDestroyViewport", &D_Viewport, reinterpret_cast<void**>(&o_Viewport)));
+		g_thunks.push_back(new ThunkRow("CrBuildingComponent", "ServerDestructBuildingOnBegin", &D_Destruct, reinterpret_cast<void**>(&o_Destruct)));
+		g_thunks.push_back(new ThunkRow("CrBuildingComponent", "ServerSpawnActorFromSubsystem", &D_Spawn, reinterpret_cast<void**>(&o_Spawn)));
+	}
+
+	bool ExecAddress_SEH(void* function, uintptr_t& out)
+	{
+		__try
+		{
+			auto* f = static_cast<SDK::UFunction*>(function);
+			if (!(static_cast<uint32_t>(f->FunctionFlags) & 0x400u)) return false; // FUNC_Native
+			out = reinterpret_cast<uintptr_t>(f->ExecFunction);
+			return out != 0;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+
+	// Reflected size of FCrMinedResource through the SDK's object table; logged once.
+	SDK::UScriptStruct* FindMinedResourceStruct() { return SDK::UObject::FindObjectFast<SDK::UScriptStruct>("CrMinedResource"); }
+
+	void LogStructSize()
+	{
+		__try
+		{
+			SDK::UScriptStruct* st = FindMinedResourceStruct();
+			if (st) AppendF("FCrMinedResource reflected struct size = %d (0x%X)", st->Size, st->Size);
+			else Append("FCrMinedResource: struct object not found; size not logged");
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { Append("FCrMinedResource: struct size lookup faulted; not logged"); }
+	}
+
+	// Runs once on the game thread when the object walker is ready: resolves each UFunction, installs its thunk hook.
+	void InstallThunks()
+	{
+		IPluginHooks* hooks = GetHooks();
+		if (!hooks || !hooks->ObjectWalker || !hooks->ObjectWalker->IsReady() || !hooks->Hooks || !hooks->Hooks->Install) return;
+		if (g_thunksInstalled.exchange(true)) return;
+		for (ThunkRow* r : g_thunks)
+		{
+			void* fn = hooks->ObjectWalker->ResolveUFunction(r->cls, r->fn);
+			if (!fn) { AppendF("%s: UFunction not found", r->name.c_str()); continue; }
+			if (!ExecAddress_SEH(fn, r->address)) { AppendF("%s: not a native UFunction with an exec thunk", r->name.c_str()); continue; }
+			r->handle = hooks->Hooks->Install(r->address, r->detour, r->original);
+			AppendF("%s: exec thunk 0x%llX %s", r->name.c_str(), static_cast<unsigned long long>(r->address), r->handle ? "hooked" : "INSTALL FAILED");
+		}
+		LogStructSize();
 	}
 
 	// ---- Original pointers. ----
@@ -388,6 +620,7 @@ namespace
 	void OnTick(float dt)
 	{
 		if (g_shutdown) return;
+		if (!g_thunksInstalled) InstallThunks();
 		void* keeper = nullptr;
 		int value = -1;
 		if (ReadUnlock_SEH(&keeper, &value))
@@ -408,7 +641,12 @@ namespace
 			{
 				const uint32_t n = r->sinceSummary.exchange(0);
 				if (n) AppendF("%s: %u more calls in the last %.0fs (total %u)", r->name, n, kSummarySecs, r->total.load());
-			}
+				}
+				for (ThunkRow* t : g_thunks)
+				{
+					const uint32_t n = t->sinceSummary.exchange(0);
+					if (n) AppendF("%s: %u more calls in the last %.0fs (total %u)", t->name.c_str(), n, kSummarySecs, t->total.load());
+				}
 		}
 		g_sinceFlush += dt;
 		if (g_sinceFlush >= kFlushSecs)
@@ -430,6 +668,14 @@ namespace
 			if (r->handle && hooks && hooks->Hooks && hooks->Hooks->Remove)
 				hooks->Hooks->Remove(r->handle);
 			r->handle = nullptr;
+		}
+		for (ThunkRow* t : g_thunks)
+		{
+			if (t->handle && hooks && hooks->Hooks && hooks->Hooks->Remove)
+				hooks->Hooks->Remove(t->handle);
+			t->handle = nullptr;
+			const uint32_t n = t->sinceSummary.exchange(0);
+			AppendF("end %s: total calls %u (%u not logged in full)", t->name.c_str(), t->total.load(), n);
 		}
 		for (HookRow* r : g_rows)
 		{
@@ -489,6 +735,7 @@ __declspec(dllexport) bool PluginInit(IPluginSelf* self)
 	g_t0 = GetTickCount64();
 	g_logPath = LogPath();
 	BuildRows();
+	BuildThunks();
 	Append("SUProbe start (logging only; nothing is changed)");
 
 	IPluginHooks* hooks = self->hooks;
